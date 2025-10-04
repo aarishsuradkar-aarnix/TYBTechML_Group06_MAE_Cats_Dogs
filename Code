@@ -1,1 +1,263 @@
+import os
 
+# Paths to your uploaded archives
+train_7z_path = "/content/train.7z"
+test_7z_path = "/content/test.7z"
+
+# Output folders (changed to train1 and test1)
+train_out_dir = "/content/train1"
+test_out_dir = "/content/test1"
+
+# Make sure output directories exist
+os.makedirs(train_out_dir, exist_ok=True)
+os.makedirs(test_out_dir, exist_ok=True)
+
+# Install p7zip if not already installed
+!apt-get install -y p7zip-full
+
+# Extract train
+!7z x "{train_7z_path}" -o"{train_out_dir}"
+
+# Extract test
+!7z x "{test_7z_path}" -o"{test_out_dir}"
+
+import pandas as pd
+
+train_df = pd.read_csv("/content/trainLabels.csv")
+sample_df = pd.read_csv("/content/sampleSubmission.csv")
+
+print(train_df.head())
+print("Number of classes:", train_df['label'].nunique())
+import os
+
+print("Train files:", len(os.listdir("/content/train")))
+print("Test files:", len(os.listdir("/content/test")))
+import os
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader, random_split
+from torchvision import transforms
+from PIL import Image
+import matplotlib.pyplot as plt
+import numpy as np
+
+# Hyperparameters
+BATCH_SIZE = 64
+IMAGE_SIZE = 48
+PATCH_SIZE = 6
+ENC_PROJECTION_DIM = 128
+DEC_PROJECTION_DIM = 64
+ENC_LAYERS = 3
+DEC_LAYERS = 1
+LEARNING_RATE = 5e-3
+EPOCHS = 50
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+class CustomImageDataset(Dataset):
+    def __init__(self, img_dir, transform=None, is_test=False):
+        self.img_dir = img_dir
+        self.transform = transform
+        self.is_test = is_test
+        self.images = sorted(os.listdir(img_dir))  # ensure consistent ordering
+
+    def __len__(self):
+        return len(self.images)
+
+    def __getitem__(self, idx):
+        img_path = os.path.join(self.img_dir, self.images[idx])
+        image = Image.open(img_path).convert("RGB")
+        if self.transform:
+            image = self.transform(image)
+        if self.is_test:
+            return image
+        else:
+            return image, 0  # dummy label for training
+train_transform = transforms.Compose([
+    transforms.Resize((IMAGE_SIZE + 20, IMAGE_SIZE + 20)),
+    transforms.RandomCrop((IMAGE_SIZE, IMAGE_SIZE)),
+    transforms.RandomHorizontalFlip(),
+    transforms.ToTensor(),
+])
+
+test_transform = transforms.Compose([
+    transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
+    transforms.ToTensor(),
+])
+# Train dataset
+train_dataset = CustomImageDataset(img_dir="/content/train", transform=train_transform)
+test_dataset = CustomImageDataset(img_dir="/content/test", transform=test_transform, is_test=True)
+
+# Split train into train/validation
+train_size = int(0.8 * len(train_dataset))
+val_size = len(train_dataset) - train_size
+train_ds, val_ds = random_split(train_dataset, [train_size, val_size])
+val_ds.dataset.transform = test_transform
+
+# DataLoaders
+train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=2)
+val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False)
+test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
+class Patches(nn.Module):
+    def __init__(self, patch_size=PATCH_SIZE):
+        super().__init__()
+        self.patch_size = patch_size
+
+    def forward(self, images):
+        B, C, H, W = images.shape
+        patches = images.unfold(2, self.patch_size, self.patch_size).unfold(3, self.patch_size, self.patch_size)
+        patches = patches.contiguous().view(B, C, -1, self.patch_size, self.patch_size)
+        patches = patches.permute(0, 2, 1, 3, 4)
+        patches = patches.flatten(2)
+        return patches
+class MAE(nn.Module):
+    def __init__(self, patch_size=PATCH_SIZE, enc_dim=ENC_PROJECTION_DIM, dec_dim=DEC_PROJECTION_DIM):
+        super().__init__()
+        self.patch_layer = Patches(patch_size)
+        # Encoder
+        self.encoder = nn.Sequential(
+            nn.Linear(patch_size*patch_size*3, enc_dim),
+            nn.ReLU(),
+            *[nn.Sequential(nn.Linear(enc_dim, enc_dim), nn.ReLU()) for _ in range(ENC_LAYERS-1)]
+        )
+        # Decoder
+        self.decoder = nn.Sequential(
+            nn.Linear(enc_dim, dec_dim),
+            nn.ReLU(),
+            nn.Linear(dec_dim, patch_size*patch_size*3)
+        )
+
+    def forward(self, x):
+        patches = self.patch_layer(x)           # (B, num_patches, patch_dim)
+        encoded = self.encoder(patches)         # (B, num_patches, enc_dim)
+        decoded = self.decoder(encoded)         # (B, num_patches, patch_dim)
+
+        # Reconstruct full image
+        B, num_patches, D = decoded.shape
+        n = int(np.sqrt(num_patches))
+        C = 3
+        patch_size = int(np.sqrt(D//C))
+        decoded = decoded.view(B, n, n, C, patch_size, patch_size).permute(0, 3, 1, 4, 2, 5)
+        decoded = decoded.contiguous().view(B, C, n*patch_size, n*patch_size)
+        return decoded
+def show_reconstruction(model, loader, num_images=5):
+    import matplotlib.pyplot as plt
+    
+    model.eval()
+    images = next(iter(loader))
+    
+    # If loader returns (images, labels), take only images
+    if isinstance(images, (list, tuple)):
+        images = images[0]
+    
+    images = images.to(DEVICE)
+    with torch.no_grad():
+        reconstructed = model(images)
+    
+    images = images.cpu().permute(0, 2, 3, 1).numpy()        # B, H, W, C
+    reconstructed = reconstructed.cpu().permute(0, 2, 3, 1).numpy()
+    
+    plt.figure(figsize=(15, 6))
+    for i in range(num_images):
+        # Original
+        plt.subplot(2, num_images, i + 1)
+        plt.imshow(images[i])
+        plt.title("Original")
+        plt.axis('off')
+        # Reconstructed
+        plt.subplot(2, num_images, i + 1 + num_images)
+        plt.imshow(reconstructed[i])
+        plt.title("Reconstructed")
+        plt.axis('off')
+    plt.show()
+MASK_PROPORTION = 0.75  # mask 75% of patches
+
+def random_mask(patches, mask_proportion=MASK_PROPORTION):
+    B, N, D = patches.shape
+    num_mask = int(N * mask_proportion)
+    mask_indices = np.random.choice(N, num_mask, replace=False)
+    mask = torch.zeros_like(patches)
+    mask[:, mask_indices, :] = 0  # masked patches are zero
+    mask[:, [i for i in range(N) if i not in mask_indices], :] = patches[:, [i for i in range(N) if i not in mask_indices], :]
+    return mask, mask_indices
+for epoch in range(EPOCHS):
+    model.train()
+    running_loss = 0
+    for images, _ in train_loader:
+        images = images.to(DEVICE)
+        
+        # Extract patches
+        patches = model.patch_layer(images)
+        
+        # Apply random masking
+        masked_patches, mask_indices = random_mask(patches)
+        
+        # Encode + Decode masked patches
+        reconstructed = model.decoder(model.encoder(masked_patches))
+        
+        # Reconstruct full image
+        B, num_patches, D = reconstructed.shape
+        n = int(np.sqrt(num_patches))
+        C = 3
+        patch_size = int(np.sqrt(D//C))
+        reconstructed = reconstructed.view(B, n, n, C, patch_size, patch_size).permute(0, 3, 1, 4, 2, 5)
+        reconstructed = reconstructed.contiguous().view(B, C, n*patch_size, n*patch_size)
+        
+        loss = nn.MSELoss()(reconstructed, images)
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        running_loss += loss.item()
+    
+    print(f"Epoch {epoch+1}/{EPOCHS}, Loss: {running_loss/len(train_loader):.4f}")
+def show_masked_reconstruction(model, loader, mask_proportion=0.75, num_images=5):
+    model.eval()
+    images = next(iter(loader))
+    
+    if isinstance(images, (list, tuple)):
+        images = images[0]
+    
+    images = images.to(DEVICE)
+    with torch.no_grad():
+        patches = model.patch_layer(images)
+        
+        # Random mask
+        B, N, D = patches.shape
+        num_mask = int(N * mask_proportion)
+        mask_indices = [np.random.choice(N, num_mask, replace=False) for _ in range(B)]
+        
+        masked_patches = patches.clone()
+        for i, indices in enumerate(mask_indices):
+            masked_patches[i, indices, :] = 0
+        
+        reconstructed = model.decoder(model.encoder(masked_patches))
+        n = int(np.sqrt(N))
+        C = 3
+        patch_size = int(np.sqrt(D//C))
+        reconstructed = reconstructed.view(B, n, n, C, patch_size, patch_size).permute(0, 3, 1, 4, 2, 5)
+        reconstructed = reconstructed.contiguous().view(B, C, n*patch_size, n*patch_size)
+    
+    images = images.cpu().permute(0,2,3,1).numpy()
+    reconstructed = reconstructed.cpu().permute(0,2,3,1).numpy()
+    
+    plt.figure(figsize=(15,6))
+    for i in range(num_images):
+        # Original
+        plt.subplot(3, num_images, i+1)
+        plt.imshow(images[i])
+        plt.title("Original")
+        plt.axis('off')
+        # Masked input (zeros where masked)
+        masked_img = patches[i].clone().cpu()
+        masked_img = masked_img.view(n, n, C, patch_size, patch_size).permute(2,0,3,1,4).contiguous().view(C, n*patch_size, n*patch_size)
+        masked_img = masked_img.permute(1,2,0).numpy()
+        plt.subplot(3, num_images, i+1+num_images)
+        plt.imshow(masked_img)
+        plt.title("Masked Input")
+        plt.axis('off')
+        # Reconstructed
+        plt.subplot(3, num_images, i+1+2*num_images)
+        plt.imshow(reconstructed[i])
+        plt.title("Reconstructed")
+        plt.axis('off')
+    plt.show()
+show_masked_reconstruction(model, val_loader, mask_proportion=0.75, num_images=5)
